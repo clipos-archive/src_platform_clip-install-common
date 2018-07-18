@@ -1,0 +1,113 @@
+.TH CLIP_INSTALL 8 "JUNE 2007" Linux "User Manuals"
+.SH NAME
+clip_install \- Clip packages installer.
+.SH SYNOPSIS
+.B clip_install
+[\-h] |\-v] -d
+.I distribution
+-p
+.I part
+.SH DESCRIPTION
+.B clip_install
+performs clip packages installation.
+.B clip_install
+is intended to be run non-interactively and must be run AFTER packages download. 
+This script updates its own 
+.B apt
+cache using a local debian mirror, then removes from its cache high-impact packages and packages whose signatures have not been successfully verified using 
+.BR verify-sign-full (1)
+, unless options are given in a configuration file
+.BR clip_install.conf (5).
+.PP
+It tries then to upgrade the system by using 
+.BR "apt-get dist-upgrade"
+on the remaining packages.
+.PP
+The
+.B apt
+cache directory and the lock files managed by this tool MUST NOT be cleaned or removed manually. 
+.PP
+The
+.B apt.conf
+(5) configuration file used must be located in 
+.B /etc/clip_update/clip_install/
+and must be named after the distribution and the part to install :
+
+.B - /etc/clip_update/clip_install/apt.conf.clip.core
+for the
+.I core
+part
+of the
+.I clip
+distribution.
+
+.B - /etc/clip_update/clip_install/apt.conf.clip.apps
+for the
+.I apps
+part
+of the
+.I clip
+distribution.
+
+.B - /etc/clip_update/clip_install/apt.conf.rm.core
+for the
+.I core
+part
+of the
+.I rm
+distribution.
+
+.B - /etc/clip_update/clip_install/apt.conf.rm.apps
+for the
+.I apps
+part
+of the
+.I rm
+distribution.
+
+The logs are stored using 
+.BR logger (1).
+.SH MANDATORY PARAMETERS
+.IP \-d distribution
+Specify the distribution to update. Should be either 
+.I clip
+or 
+.I rm
+.IP \-p part
+Specify the part of the distribution to update. Should be either 
+.I core
+or 
+.I apps
+.SH OPTIONS
+.IP \-h
+Print help and exit
+.IP \-v
+Print version of the utility and exit
+.SH RESOURCES
+.PP Depends on 
+.BR sh (1)
+,
+.BR awk (1)
+,
+.BR sed (1)
+,
+.BR find (1)
+,
+.BR logger (1)
+,
+.BR apt-cache (8)
+, 
+.BR apt-get (8)
+,
+.BR verify-sign-full (1)
+and
+.BR clip_install.conf (5)
+.SH DIAGNOSTICS
+The script returns 2 if an error occured, 0 if no packages were installed, 5 if packages were installed on the core part of the clip distribution, 0 if packages were installed otherwise.
+.PP
+If the execution fails during packages installation, the utility will try to return to old state next time it will run.
+If the execution fails during signatures verification or high-impact packages removal, it will retry on the next run.
+.SH AUTHORS
+EADS Defence And Security Systems
+.SH SEE ALSO
+.BR verify-sign-full (1), clip_install.conf (5)

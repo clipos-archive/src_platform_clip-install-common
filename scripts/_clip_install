@@ -1,0 +1,369 @@
+#!/usr/bin/perl
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright © 2007-2018 ANSSI. All Rights Reserved.
+
+#######################################################################
+# clip_install - install CLIP packages from a local mirror
+# Copyright (C) 2008 SGDN/DCSSI
+# Copyright (C) 2010-2013 SGDSN/ANSSI
+# Author: Vincent Strubel <clipos@ssi.gouv.fr>
+#
+# All rights reserved.
+#######################################################################
+
+
+use strict;
+use warnings;
+use Getopt::Long;
+use CLIP::Pkg::Base ':all';
+use CLIP::Pkg::Install ':all';
+use CLIP::Conf::Base ':all';
+
+use CLIP::Logger ':all';
+use Sys::Syslog qw(:macros);
+
+###############################################################
+#                    Global vars                              #
+###############################################################
+
+
+###### Consts ######
+my @g_dists = qw(clip rm);
+
+my %g_parts = (
+	core	=>	"Required",
+	apps	=>	"Important",
+);
+
+###### Paths ######
+
+$CLIP::Pkg::Base::g_prefix_key = "";
+
+$g_log_prefix = "clip_install";
+
+$g_log_syslog = 1;
+
+$g_log_debug = 0;
+$CLIP::Logger::g_facilities->{"warn"} = LOG_LOCAL7;
+$CLIP::Logger::g_facilities->{"log"} = LOG_LOCAL7;
+
+# Defined based on command line
+my $g_dist = "";
+my $g_part = "";
+my $g_conf_file = ""; 
+my $g_apt_config = "";
+my $g_sources_list = "";
+my $g_mirror_dir = "";
+my $g_lock_file = "";
+my $g_update_lock_file = "";
+my $g_root = "";
+
+###### Options ######
+
+my $g_nolock = 0;
+my $g_check = 0;
+
+# Updated from config file
+$CLIP::Pkg::Base::g_pkg_opts->{'Impact'} = 0;
+
+# Global configuration options
+$CLIP::Pkg::Base::g_conf_opts = {
+	rej_young		=> 0,	
+	rej_old			=> 0,
+	rej_older		=> 0,	
+};
+	
+###### Command line ######
+
+sub usage($) {
+	my $fh = shift;
+
+	print $fh "clip_install - upgrade clip packages from the local mirror\n";
+	print $fh "Usage: clip_install -d <dist> -p <part> [options]\n";
+	print $fh "Options:\n";
+	print $fh "   -p[art] <part>   : upgrade <part> (\"core\" or \"apps\") packages\n";
+	print $fh "   -d[ist] <dist>   : upgrade packages from the <dist> distribution\n";
+	print $fh "   -h[elp]          : print this help and exit\n";
+	print $fh "   -V[erbose]       : be more verbose\n";
+	print $fh "   -F[oreground]    : run in foreground, log messages to console\n";
+	print $fh "   -I[nteractive]   : log messages both to console and syslog\n";
+	print $fh "   -c[heck]         : check for available updates, don't install them\n";
+	print $fh "   -r[oot] <root>   : install packages in root path <root>\n";
+	print $fh "   -n[olock]        : do not use locks to prevent simultaneous runs\n";
+	print $fh "   -t[rylock]       : use non-blocking locks\n";
+}
+
+sub merror($) {
+	my $msg = shift;
+
+	clip_warn $msg;
+	exit 1;
+}
+
+sub get_options() {
+	eval {
+		GetOptions (
+			'help'		=>	sub {usage(*STDOUT{IO}); exit 0},
+			'dist=s'	=>	\$g_dist,
+			'nolock'	=>	\$g_nolock,
+			'part=s'	=>	\$g_part,
+			'root=s'	=>	\$g_root,
+			'trylock'	=>	\$CLIP::Pkg::Base::g_lock_nonblock,
+			'Foreground'	=>	sub { $g_log_syslog = 0 },
+			'Interactive'	=>	sub { $g_log_syslog = 2 },
+			'check'		=>	\$g_check,
+			'Verbose'	=>	\$g_log_debug,
+		) or die 1;
+	};
+
+	return 0 if ($@);
+
+	merror "missing distribution argument" if (not $g_dist);
+	merror "invalid distribution argument: $g_dist" if (not grep {$_ eq $g_dist} @g_dists);
+	
+	merror "missing part argument" if (not $g_part);
+	merror "invalid part argument: $g_part" if (not grep {$_ eq $g_part} (keys %g_parts));
+
+	if ($g_part eq "core") {
+		$CLIP::Pkg::Base::g_optional_pkg_files = [];
+	} else {
+		$CLIP::Pkg::Base::g_optional_pkg_files = [ "/etc/admin/clip_install/optional.conf.$g_dist" ];
+	}
+	if ($g_dist eq "clip" and $g_part eq "core") {
+		$g_apt_config="/update_root/etc/clip_update/clip_install/apt.conf.$g_dist.$g_part";
+		$CLIP::Pkg::Base::g_prefix_key = "/update_root";
+	} else {
+		$g_apt_config="/etc/clip_update/clip_install/apt.conf.$g_dist.$g_part";
+	}
+	if ($g_root) {
+		my $tmp = $g_root;
+		$tmp =~ s/\/$//;
+		$tmp =~ s/\//\./g;
+		$g_apt_config="$g_apt_config$tmp";
+		$CLIP::Pkg::Install::g_dpkg_install_dir = $g_root;
+	}
+	$g_conf_file="/etc/admin/clip_install/clip_install_$g_dist"."_"."$g_part.conf";
+
+	$CLIP::Pkg::Base::g_pkg_opts->{'Distribution'} = $g_dist;
+	$CLIP::Pkg::Base::g_pkg_opts->{'Priority'} = $g_parts{$g_part};
+
+	$CLIP::Pkg::Base::g_sigcheck_sockpath = "/var/run/sigcheck-install-$g_part";
+	$CLIP::Pkg::Base::g_dpkg_reinst_cache = 
+		"/var/pkg/cache/apt/clip_install/".$g_dist."/".$g_part;
+
+	return 1;
+}
+
+sub check_option_files() {
+	merror "missing install config file $g_apt_config"
+					unless (-f $g_conf_file);
+	merror "missing apt config file $g_apt_config"
+					unless (-f $g_apt_config);
+}
+
+sub read_mirror_path() {
+	open IN, "<", "$g_sources_list"
+		or merror "Could not open $g_sources_list";
+
+	my @lines = <IN>;
+	close IN;
+
+	foreach my $line (@lines) {
+		next if (not $line =~ /^deb/);
+
+		$line =~ /^deb\s+copy:\/\/(\/\S+)\s/
+			or merror "Invalid sources.list line: $line";
+		my $tmp = $1;
+		$tmp =~ s/\/mirrors$//;
+		if ($g_mirror_dir) {
+			clip_warn "multiple definitions of mirror dir: "
+					."overriding $g_mirror_dir with $tmp";
+		}
+
+		$g_mirror_dir = $tmp;
+	}
+	merror "no definition for mirror dir" unless ($g_mirror_dir);
+}
+
+sub get_config() {
+	my $tmp; 
+
+	## Configuration dates ##
+	if (defined ($tmp = clip_import_conf($g_conf_file, "option_install_high_impact_packages", "yes|no"))) {
+		if ($tmp eq "yes") {
+			$CLIP::Pkg::Base::g_pkg_opts{'Impact'} = 1;
+		} else  {
+			$CLIP::Pkg::Base::g_pkg_opts{'Impact'} = 0;
+		}
+	} 
+
+	if (defined ($tmp = clip_import_conf($g_conf_file, "verbose", "yes|no"))) {
+		if ($tmp eq "yes") {
+			$g_log_debug = 1;
+		}
+	}
+
+	## Apt / dpkg paths ##
+	# Relaxed regexps, these are trusted files
+	if (not defined ($tmp = clip_import_conf_sep($g_apt_config, "Dir::Cache", "\\S+", " "))) {
+		merror "could not read apt cache path";
+	} else {
+		$tmp =~ s/["";]//g;
+		$CLIP::Pkg::Install::g_apt_cache_dir = $tmp;
+	}
+
+	if (not defined ($tmp = clip_import_conf_sep($g_apt_config, "Dir::State::Status", "\\S+", " "))) {
+		merror "could not read dpkg admin path";
+	} else {
+		$tmp =~ s/["";]//g;
+		$tmp =~ s/\/status$//;
+		$CLIP::Pkg::Base::g_dpkg_admin_dir = $tmp;
+	}
+
+	if (not defined ($tmp = clip_import_conf_sep($g_apt_config, "Dir::Etc::SourceList", "\\S+", " "))) {
+		merror "could not read sources.list path";
+	} else {
+		$tmp =~ s/["";]//g;
+		$g_sources_list = $tmp;
+	}
+
+	read_mirror_path();
+
+	$g_lock_file="$g_mirror_dir/lock";
+	$g_update_lock_file="$g_mirror_dir/clip_update.lck";
+}
+
+sub check_config_files() {
+	merror "no mirror directory: $g_mirror_dir" unless (-d $g_mirror_dir);
+	merror "no cache directory: $CLIP::Pkg::Install::g_apt_cache_dir"
+		unless (-d $CLIP::Pkg::Install::g_apt_cache_dir);
+	merror "no dpkg admin dir $CLIP::Pkg::Base::g_dpkg_admin_dir" 
+		unless (-d $CLIP::Pkg::Base::g_dpkg_admin_dir);
+}
+
+sub cleanup($) {
+	my $reason = shift;
+
+	clip_warn "Abnormal termination: $reason. Cleaning up.";
+
+	clippkg_sigcheck_stop();
+
+	exit 1;
+}
+
+###############################################################
+#                    Main                                     #
+###############################################################
+
+clip_logger_init;
+get_options or merror "failed to parse options";
+clip_log "starting run for dist $g_dist and part $g_part";
+check_option_files;
+get_config;
+check_config_files;
+
+if (-e $g_update_lock_file) {
+	merror "updates are locked for current jail";
+}
+
+my $lock;
+my $ret = 1;
+
+my $arch; 
+if (not defined($arch = clippkg_get_arch())) {
+	merror "could not get arch string, aborting";
+}
+
+$CLIP::Pkg::Install::g_arch = $arch;
+
+if (not $g_nolock and not defined ($lock = clippkg_lock($g_lock_file))) {
+	merror "could not lock $g_lock_file, aborting";
+}
+
+$ENV{'APT_CONFIG'} = $g_apt_config;
+$ENV{'PATH'} = "/bin:/sbin:/usr/bin:/usr/sbin"; 
+
+if ($g_part eq "core") {
+	$ENV{'BOOTSTRAP_NOVERIEXEC'} = "yes";
+}
+
+my $flagdir = "$g_mirror_dir/mirrors/flags";
+my $flagfile = $flagdir."/".$g_dist."_".$g_part;
+
+# Note: we might need to check signatures during error recovery, in
+# which case we will use the fallback through ccsd-check, since
+# ccsd-checker-daemon is not started yet. 
+# Rationale : we don't want to start ccsd-checker-daemon when
+# simply checking, since we generally don't need it, and it takes
+# a second or two (loooooooong!) to start. But we still need
+# to run the recovery before checking, otherwise we might check
+# from an incoherent state.
+
+# Let's be prudent and remove any leftover sockets - otherwise 
+# we might end up not getting the desired fallback...
+unlink ($CLIP::Pkg::Base::g_sigcheck_sockpath)
+	if (-e $CLIP::Pkg::Base::g_sigcheck_sockpath);
+
+if (not clippkg_install_error_recovery()) {
+	clip_warn "error recovery failed, aborting";
+	goto OUT_UNLOCK;
+}
+
+clip_warn "failed to remove optionals" unless (clippkg_remove_optionals($g_dist));
+
+if ($g_check) {
+	my $avail = clippkg_check_upgrade($g_mirror_dir, $g_dist, 1, 0);
+	if (not $avail) {
+		clip_warn "failed to check for update, aborting";
+		goto OUT_UNLOCK;
+	}
+	if ($avail == 1) {
+		clip_log "no update available";
+		$ret = 0;
+		goto OUT_UNLOCK;
+	}
+	if ($avail == 2) {
+		clip_log "update available";
+		$ret = 5;
+		goto OUT_UNLOCK;
+	}
+	clip_warn "unexpected check_upgrade return value: $avail. Aborting";
+	goto OUT_UNLOCK;
+}
+
+local $SIG{__DIE__} = sub {cleanup("uncaught die()")};
+local $SIG{'INT'} = sub {cleanup("interrupted")};
+local $SIG{'QUIT'} = sub {cleanup("interrupted")};
+local $SIG{'TERM'} = sub {cleanup("killed")};
+local $SIG{'ABRT'} = sub {cleanup("aborted")};
+
+if (not clippkg_sigcheck_start(0)) {
+	clip_warn "failed to start signature checker, aborting";
+	goto OUT_UNLOCK;
+}
+
+my $upgrade;
+$upgrade = clippkg_upgrade($g_mirror_dir, $g_dist);
+if (not $upgrade) {
+	clip_warn "upgrade failed for $g_dist-$g_part";
+	goto OUT;
+}
+
+$ret = 0;
+if ($upgrade == 2) {
+	clip_log "upgrade complete for $g_dist-$g_part";
+	if (-e $flagfile) { 
+		unlink $flagfile 
+			or warn "failed to remove flag $flagfile";
+	}
+} else {
+	clip_log "no upgrade performed for $g_dist-$g_part";
+}
+
+OUT:
+clippkg_sigcheck_stop();
+OUT_UNLOCK:
+clippkg_unlock($lock, $g_lock_file) if (not $g_nolock);
+exit $ret;
+	
+
